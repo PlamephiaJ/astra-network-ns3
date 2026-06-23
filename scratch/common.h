@@ -97,6 +97,9 @@ NodeContainer n;
 
 uint64_t nic_rate;
 
+// Defined by the ASTRA-sim NS-3 frontend after this header is included.
+extern int num_npus;
+
 uint64_t maxRtt, maxBdp;
 
 std::vector<Ipv4Address> serverAddress;
@@ -156,6 +159,11 @@ struct QlenDistribution {
 };
 map<uint32_t, map<uint32_t, uint32_t>> queue_result;
 void monitor_buffer(FILE *qlen_output, NodeContainer *n) {
+  const uint64_t now =
+      static_cast<uint64_t>(Simulator::Now().GetTimeStep());
+  if (now > qlen_mon_end)
+    return;
+
   for (uint32_t i = 0; i < n->GetN(); i++) {
     if (n->Get(i)->GetNodeType() == 1) { // is switch
       Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n->Get(i));
@@ -203,8 +211,9 @@ void monitor_buffer(FILE *qlen_output, NodeContainer *n) {
     }
   }
   fflush(qlen_output);
-  Simulator::Schedule(NanoSeconds(qlen_mon_interval), &monitor_buffer,
-                      qlen_output, n);
+  if (now < qlen_mon_end)
+    Simulator::Schedule(NanoSeconds(qlen_mon_interval), &monitor_buffer,
+                        qlen_output, n);
 }
 
 void CalculateRoute(Ptr<Node> host) {
@@ -239,7 +248,8 @@ void CalculateRoute(Ptr<Node> host) {
         if (next->GetNodeType() == 1)
           q.push_back(next);
       }
-      if (d + 1 == dis[next]) {
+      if (d + 1 == dis[next] &&
+          (next->GetNodeType() == 1 || next->GetId() < (uint32_t)num_npus)) {
         nextHop[next][host].push_back(now);
       }
     }
@@ -261,7 +271,10 @@ void CalculateRoute(Ptr<Node> host) {
 void CalculateRoutes(NodeContainer &n) {
   for (int i = 0; i < (int)n.GetN(); i++) {
     Ptr<Node> node = n.Get(i);
-    if (node->GetNodeType() == 0)
+    // ASTRA-sim ranks map directly to the first num_npus NS-3 server nodes.
+    // Physical servers beyond that range cannot be communication destinations
+    // in this run, so avoid building unused destination routing tables.
+    if (node->GetNodeType() == 0 && node->GetId() < (uint32_t)num_npus)
       CalculateRoute(node);
   }
 }
@@ -745,6 +758,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
     }
   }
 
+  time_t setup_phase_start = time(NULL);
 #if ENABLE_QP
   FILE *fct_output = fopen(fct_output_file.c_str(), "w");
   std::cout << "QP is enabled " << std::endl;
@@ -752,7 +766,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
   // install RDMA driver
   //
   for (uint32_t i = 0; i < node_num; i++) {
-    if (n.Get(i)->GetNodeType() == 0) { // is server
+    if (n.Get(i)->GetNodeType() == 0 &&
+        n.Get(i)->GetId() < (uint32_t)num_npus) { // is an active server
       // create RdmaHw
       Ptr<RdmaHw> rdmaHw = CreateObject<RdmaHw>();
       rdmaHw->SetAttribute("ClampTargetRate", BooleanValue(clamp_target_rate));
@@ -796,6 +811,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
           "QpComplete", MakeBoundCallback(qp_finish, fct_output));
     }
   }
+  std::cout << "Installed " << num_npus << " active RDMA endpoints in "
+            << difftime(time(NULL), setup_phase_start) << " s" << std::endl;
 #endif
 
   // set ACK priority on hosts
@@ -805,17 +822,25 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
     RdmaEgressQueue::ack_q_idx = 3;
 
   // setup routing
+  setup_phase_start = time(NULL);
   CalculateRoutes(n);
+  std::cout << "Calculated routes for " << num_npus << " active ranks in "
+            << difftime(time(NULL), setup_phase_start) << " s" << std::endl;
+  setup_phase_start = time(NULL);
   SetRoutingEntries();
+  std::cout << "Installed routing entries in "
+            << difftime(time(NULL), setup_phase_start) << " s" << std::endl;
 
   //
   // get BDP and delay
   //
   maxRtt = maxBdp = 0;
-  for (uint32_t i = 0; i < node_num; i++) {
+  const uint32_t active_node_num =
+      std::min(node_num, static_cast<uint32_t>(num_npus));
+  for (uint32_t i = 0; i < active_node_num; i++) {
     if (n.Get(i)->GetNodeType() != 0)
       continue;
-    for (uint32_t j = 0; j < node_num; j++) {
+    for (uint32_t j = 0; j < active_node_num; j++) {
       if (n.Get(j)->GetNodeType() != 0)
         continue;
       uint64_t delay = pairDelay[n.Get(i)][n.Get(j)];
@@ -880,7 +905,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
     sim_setting.Serialize(trace_output);
   }
 
-  Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+  // RDMA forwarding uses the ECMP entries installed by SetRoutingEntries().
+  // Populating a second set of IPv4 global routes is redundant here and has
+  // prohibitive all-node setup cost for large physical topologies.
 
   NS_LOG_INFO("Create Applications.");
 

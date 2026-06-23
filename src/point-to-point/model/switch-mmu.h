@@ -10,7 +10,8 @@ class Packet;
 
 class SwitchMmu: public Object{
 public:
-	static const uint32_t pCnt = 1025;	// Number of ports used
+	// Must match SwitchNode::pCnt: one loopback plus 64 data ports.
+	static const uint32_t pCnt = 65;
 	static const uint32_t qCnt = 8;	// Number of queues/priorities used
 
 	static TypeId GetTypeId (void);
@@ -64,4 +65,3 @@ public:
 } /* namespace ns3 */
 
 #endif /* SWITCH_MMU_H */
-

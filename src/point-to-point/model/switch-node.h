@@ -12,7 +12,10 @@ namespace ns3 {
 class Packet;
 
 class SwitchNode : public Node{
-	static const uint32_t pCnt = 1025;	// Number of ports used
+	// One loopback plus up to 64 data ports. The bundled topologies use at most
+	// 24 data ports; dfly(4,8,4,33) uses 15. Keeping this at 1025 allocates a
+	// 32 MiB ingress/egress counter matrix per switch.
+	static const uint32_t pCnt = 65;
 	static const uint32_t qCnt = 8;	// Number of queues/priorities used
 	uint32_t m_ecmpSeed;
 	std::unordered_map<uint32_t, std::vector<int> > m_rtTable; // map from ip address (u32) to possible ECMP port (index of dev)
