@@ -26,7 +26,10 @@
 #include "ns3/packet.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/qbb-helper.h"
+#include <chrono>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <ns3/rdma-client-helper.h>
 #include <ns3/rdma-client.h>
@@ -34,6 +37,7 @@
 #include <ns3/rdma.h>
 #include <ns3/sim-setting.h>
 #include <ns3/switch-node.h>
+#include <sstream>
 #include <time.h>
 #include <unordered_map>
 
@@ -41,6 +45,26 @@ using namespace ns3;
 using namespace std;
 
 NS_LOG_COMPONENT_DEFINE("GENERIC_SIMULATION");
+
+std::string ns3_progress_timestamp() {
+  using namespace std::chrono;
+  const auto now = system_clock::now();
+  const auto now_time = system_clock::to_time_t(now);
+  const auto millis =
+      duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+  std::tm local_time;
+  localtime_r(&now_time, &local_time);
+
+  std::ostringstream out;
+  out << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "."
+      << std::setfill('0') << std::setw(3) << millis.count();
+  return out.str();
+}
+
+void ns3_progress_log(const std::string &message) {
+  std::cout << "[" << ns3_progress_timestamp() << "] [ns3-progress] "
+            << message << std::endl;
+}
 
 uint32_t cc_mode = 1;
 bool enable_qcn = true, use_dynamic_pfc_threshold = true;
@@ -556,6 +580,7 @@ void SetConfig() {
 }
 
 bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
+  ns3_progress_log("SetupNetwork: open topology/flow/trace files");
 
   topof.open(topology_file.c_str());
   if (!topof.is_open()) {
@@ -579,6 +604,14 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
   topof >> node_num >> switch_num >> link_num;
   flowf >> flow_num;
   tracef >> trace_num;
+  {
+    std::ostringstream msg;
+    msg << "SetupNetwork: parsed topology"
+        << " node_num=" << node_num << " switch_num=" << switch_num
+        << " link_num=" << link_num << " flow_num=" << flow_num
+        << " trace_num=" << trace_num;
+    ns3_progress_log(msg.str());
+  }
 
   std::vector<uint32_t> node_type(node_num, 0);
   for (uint32_t i = 0; i < switch_num; i++) {
@@ -597,9 +630,11 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
   }
 
   NS_LOG_INFO("Create nodes.");
+  ns3_progress_log("SetupNetwork: created nodes");
 
   InternetStackHelper internet;
   internet.Install(n);
+  ns3_progress_log("SetupNetwork: installed internet stack");
 
   //
   // Assign IP to each server
@@ -612,6 +647,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
   }
 
   NS_LOG_INFO("Create channels.");
+  ns3_progress_log("SetupNetwork: creating channels");
 
   Ptr<RateErrorModel> rem = CreateObject<RateErrorModel>();
   Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
@@ -703,10 +739,18 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
     DynamicCast<QbbNetDevice>(d.Get(1))->TraceConnectWithoutContext(
         "QbbPfc", MakeBoundCallback(&get_pfc, pfc_file,
                                     DynamicCast<QbbNetDevice>(d.Get(1))));
+    if ((i + 1) % 1000 == 0 || i + 1 == link_num) {
+      std::ostringstream msg;
+      msg << "SetupNetwork: created channels " << (i + 1) << "/"
+          << link_num;
+      ns3_progress_log(msg.str());
+    }
   }
 
   nic_rate = get_nic_rate(n);
+  ns3_progress_log("SetupNetwork: configuring switches");
   // config switch
+  uint32_t configured_switches = 0;
   for (uint32_t i = 0; i < node_num; i++) {
     if (n.Get(i)->GetNodeType() == 1) { // is switch
       Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
@@ -742,15 +786,25 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
       sw->m_mmu->ConfigNPort(sw->GetNDevices() - 1);
       sw->m_mmu->ConfigBufferSize(buffer_size * 1024 * 1024);
       sw->m_mmu->node_id = sw->GetId();
+      configured_switches++;
+      if (configured_switches % 64 == 0 ||
+          configured_switches == switch_num) {
+        std::ostringstream msg;
+        msg << "SetupNetwork: configured switches " << configured_switches
+            << "/" << switch_num;
+        ns3_progress_log(msg.str());
+      }
     }
   }
 
 #if ENABLE_QP
   FILE *fct_output = fopen(fct_output_file.c_str(), "w");
   std::cout << "QP is enabled " << std::endl;
+  ns3_progress_log("SetupNetwork: installing RDMA drivers");
   //
   // install RDMA driver
   //
+  uint32_t installed_rdma_hosts = 0;
   for (uint32_t i = 0; i < node_num; i++) {
     if (n.Get(i)->GetNodeType() == 0) { // is server
       // create RdmaHw
@@ -794,6 +848,14 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
       rdma->Init();
       rdma->TraceConnectWithoutContext(
           "QpComplete", MakeBoundCallback(qp_finish, fct_output));
+      installed_rdma_hosts++;
+      if (installed_rdma_hosts % 128 == 0 ||
+          installed_rdma_hosts == node_num - switch_num) {
+        std::ostringstream msg;
+        msg << "SetupNetwork: installed RDMA hosts " << installed_rdma_hosts
+            << "/" << (node_num - switch_num);
+        ns3_progress_log(msg.str());
+      }
     }
   }
 #endif
@@ -805,13 +867,19 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
     RdmaEgressQueue::ack_q_idx = 3;
 
   // setup routing
+  ns3_progress_log("SetupNetwork: CalculateRoutes begin");
   CalculateRoutes(n);
+  ns3_progress_log("SetupNetwork: SetRoutingEntries begin");
   SetRoutingEntries();
+  ns3_progress_log("SetupNetwork: routing entries ready");
 
   //
   // get BDP and delay
   //
+  ns3_progress_log("SetupNetwork: BDP matrix begin");
   maxRtt = maxBdp = 0;
+  uint32_t bdp_source_hosts = 0;
+  uint32_t total_hosts = node_num - switch_num;
   for (uint32_t i = 0; i < node_num; i++) {
     if (n.Get(i)->GetNodeType() != 0)
       continue;
@@ -830,11 +898,19 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
       if (rtt > maxRtt)
         maxRtt = rtt;
     }
+    bdp_source_hosts++;
+    if (bdp_source_hosts % 128 == 0 || bdp_source_hosts == total_hosts) {
+      std::ostringstream msg;
+      msg << "SetupNetwork: BDP source hosts " << bdp_source_hosts << "/"
+          << total_hosts;
+      ns3_progress_log(msg.str());
+    }
   }
   printf("maxRtt=%lu maxBdp=%lu\n", maxRtt, maxBdp);
 
   //
   // setup switch CC
+  ns3_progress_log("SetupNetwork: switch CC begin");
   //
   for (uint32_t i = 0; i < node_num; i++) {
     if (n.Get(i)->GetNodeType() == 1) { // switch
@@ -861,6 +937,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
   FILE *trace_output = fopen(trace_output_file.c_str(), "w");
   if (enable_trace)
     qbb.EnableTracing(trace_output, trace_nodes);
+  ns3_progress_log("SetupNetwork: trace output initialized");
 
   // dump link speed to trace file
   {
@@ -881,8 +958,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
   }
 
   Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+  ns3_progress_log("SetupNetwork: global routing tables populated");
 
   NS_LOG_INFO("Create Applications.");
+  ns3_progress_log("SetupNetwork: initialize host port matrix");
 
   Time interPacketInterval = Seconds(0.0000005 / 2);
   // maintain port number for each host
@@ -894,6 +973,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
       }
   }
   flow_input.idx = -1;
+  ns3_progress_log("SetupNetwork: host port matrix ready");
 
   topof.close();
   tracef.close();
@@ -909,6 +989,8 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
   FILE *qlen_output = fopen(qlen_mon_file.c_str(), "w");
   Simulator::Schedule(NanoSeconds(qlen_mon_start), &monitor_buffer, qlen_output,
                       &n);
+  ns3_progress_log("SetupNetwork: scheduled buffer monitor");
+  ns3_progress_log("SetupNetwork: complete");
 
   return true;
 }
