@@ -35,6 +35,7 @@
 #include <ns3/sim-setting.h>
 #include <ns3/switch-node.h>
 #include <time.h>
+#include <algorithm>
 #include <unordered_map>
 
 using namespace ns3;
@@ -77,6 +78,7 @@ uint64_t link_down_time = 0;
 uint32_t link_down_A = 0, link_down_B = 0;
 
 uint32_t enable_trace = 1;
+uint32_t enable_path_log = 0;
 
 uint32_t buffer_size = 16;
 
@@ -287,11 +289,17 @@ void SetRoutingEntries() {
       Ptr<Node> dst = j->first;
       Ipv4Address dstAddr = dst->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
       vector<Ptr<Node>> nexts = j->second;
+      // path_id is the index in this deterministic next-hop ordering.
+      std::sort(nexts.begin(), nexts.end(),
+                [](const Ptr<Node>& lhs, const Ptr<Node>& rhs) {
+                  return lhs->GetId() < rhs->GetId();
+                });
       for (int k = 0; k < (int)nexts.size(); k++) {
         Ptr<Node> next = nexts[k];
         uint32_t interface = nbr2if[node][next].idx;
         if (node->GetNodeType() == 1)
-          DynamicCast<SwitchNode>(node)->AddTableEntry(dstAddr, interface);
+          DynamicCast<SwitchNode>(node)->AddTableEntry(
+              dstAddr, interface, next->GetId());
         else {
           node->GetObject<RdmaDriver>()->m_rdma->AddTableEntry(dstAddr,
                                                                interface);
@@ -480,6 +488,8 @@ bool ReadConf(string network_configuration) {
       conf >> link_down_time >> link_down_A >> link_down_B;
     } else if (key.compare("ENABLE_TRACE") == 0) {
       conf >> enable_trace;
+    } else if (key.compare("ENABLE_PATH_LOG") == 0) {
+      conf >> enable_path_log;
     } else if (key.compare("KMAX_MAP") == 0) {
       int n_k;
       conf >> n_k;
@@ -606,6 +616,7 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
       Ptr<SwitchNode> sw = CreateObject<SwitchNode>();
       n.Add(sw);
       sw->SetAttribute("EcnEnabled", BooleanValue(enable_qcn));
+      sw->SetAttribute("PathLogging", BooleanValue(enable_path_log));
     }
   }
 

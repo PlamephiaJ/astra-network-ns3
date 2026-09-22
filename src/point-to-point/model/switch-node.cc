@@ -11,6 +11,7 @@
 #include "ppp-header.h"
 #include "ns3/simulator.h"
 #include "ns3/int-header.h"
+#include "ns3/rdma-path-selection.h"
 #include <cmath>
 
 namespace ns3 {
@@ -40,12 +41,18 @@ TypeId SwitchNode::GetTypeId (void)
 			UintegerValue(9000),
 			MakeUintegerAccessor(&SwitchNode::m_maxRtt),
 			MakeUintegerChecker<uint32_t>())
+	.AddAttribute("PathLogging",
+			"Log the first forwarding decision for every explicitly pinned flow.",
+			BooleanValue(false),
+			MakeBooleanAccessor(&SwitchNode::m_pathLogging),
+			MakeBooleanChecker())
   ;
   return tid;
 }
 
 SwitchNode::SwitchNode(){
 	m_ecmpSeed = m_id;
+	m_pathLogging = false;
 	m_node_type = 1;
 	m_mmu = CreateObject<SwitchMmu>();
 	for (uint32_t i = 0; i < pCnt; i++)
@@ -71,7 +78,9 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	// entry found
 	auto &nexthops = entry->second;
 
-	// pick one next hop based on hash
+	// Build the stable flow tuple used by both normal ECMP and explicit path
+	// pinning. The reserved RDMA port is present on every data packet and is
+	// reversed into the ACK/NACK source port.
 	union {
 		uint8_t u8[4+4+2+2];
 		uint32_t u32[3];
@@ -85,7 +94,37 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD)
 		buf.u32[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
 
+	int32_t pathId = kUnpinnedRdmaPath;
+	if (ch.l3Prot == 0x11)
+		pathId = DecodeRdmaPathFromPorts(ch.udp.sport, ch.udp.dport);
+	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD)
+		pathId = DecodeRdmaPathFromPorts(ch.ack.sport, ch.ack.dport);
+
 	uint32_t idx = EcmpHash(buf.u8, 12, m_ecmpSeed) % nexthops.size();
+	if (pathId != kUnpinnedRdmaPath && nexthops.size() > 1) {
+		NS_ASSERT_MSG(static_cast<size_t>(pathId) < nexthops.size(),
+		              "Pinned path_id has no corresponding ECMP next hop");
+		idx = static_cast<uint32_t>(pathId);
+
+		auto flow = std::make_tuple(ch.sip, ch.dip,
+		                            static_cast<uint16_t>(buf.u32[2] & 0xffff),
+		                            static_cast<uint16_t>(buf.u32[2] >> 16));
+		auto inserted = m_pinnedFlowOutDev.emplace(flow, nexthops[idx]);
+		NS_ASSERT_MSG(inserted.first->second == nexthops[idx],
+		              "A pinned RDMA flow changed paths between packets");
+
+		if (m_pathLogging && m_loggedPinnedFlows.insert(flow).second) {
+			std::cout << "NS3_PATH switch=" << GetId()
+			          << " src_ip=" << Ipv4Address(ch.sip)
+			          << " dst_ip=" << Ipv4Address(ch.dip)
+			          << " sport=" << std::get<2>(flow)
+			          << " dport=" << std::get<3>(flow)
+			          << " path=" << pathId
+			          << " out_dev=" << nexthops[idx]
+			          << " next_hop=" << m_nextHopNode[nexthops[idx]]
+			          << std::endl;
+		}
+	}
 	return nexthops[idx];
 }
 
@@ -180,13 +219,18 @@ void SwitchNode::SetEcmpSeed(uint32_t seed){
 	m_ecmpSeed = seed;
 }
 
-void SwitchNode::AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx){
+void SwitchNode::AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx,
+		uint32_t nextHopNodeId){
 	uint32_t dip = dstAddr.Get();
 	m_rtTable[dip].push_back(intf_idx);
+	m_nextHopNode[intf_idx] = nextHopNodeId;
 }
 
 void SwitchNode::ClearTable(){
 	m_rtTable.clear();
+	m_nextHopNode.clear();
+	m_pinnedFlowOutDev.clear();
+	m_loggedPinnedFlows.clear();
 }
 
 // This function can only be called in switch mode

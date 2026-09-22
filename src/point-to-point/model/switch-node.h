@@ -2,6 +2,9 @@
 #define SWITCH_NODE_H
 
 #include <unordered_map>
+#include <map>
+#include <set>
+#include <tuple>
 #include <ns3/node.h>
 #include "qbb-net-device.h"
 #include "switch-mmu.h"
@@ -19,6 +22,12 @@ class SwitchNode : public Node{
 	static const uint32_t qCnt = 8;	// Number of queues/priorities used
 	uint32_t m_ecmpSeed;
 	std::unordered_map<uint32_t, std::vector<int> > m_rtTable; // map from ip address (u32) to possible ECMP port (index of dev)
+	std::unordered_map<uint32_t, uint32_t> m_nextHopNode;
+	bool m_pathLogging;
+	std::map<std::tuple<uint32_t, uint32_t, uint16_t, uint16_t>, int>
+		m_pinnedFlowOutDev;
+	std::set<std::tuple<uint32_t, uint32_t, uint16_t, uint16_t> >
+		m_loggedPinnedFlows;
 
 	// monitor of PFC
 	uint32_t m_bytes[pCnt][pCnt][qCnt]; // m_bytes[inDev][outDev][qidx] is the bytes from inDev enqueued for outDev at qidx
@@ -48,7 +57,8 @@ public:
 	static TypeId GetTypeId (void);
 	SwitchNode();
 	void SetEcmpSeed(uint32_t seed);
-	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx);
+	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx,
+	                   uint32_t nextHopNodeId);
 	void ClearTable();
 	bool SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch);
 	void SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p);
