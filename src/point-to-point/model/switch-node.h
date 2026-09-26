@@ -6,6 +6,7 @@
 #include <set>
 #include <tuple>
 #include <ns3/node.h>
+#include <ns3/callback.h>
 #include "qbb-net-device.h"
 #include "switch-mmu.h"
 #include "pint.h"
@@ -13,6 +14,14 @@
 namespace ns3 {
 
 class Packet;
+
+enum class FlowRoutingStrategy {
+	ECMP,
+	UGAL_L,
+};
+typedef Callback<void, uint32_t, uint32_t, uint16_t, uint16_t, uint16_t,
+	bool, uint64_t>
+	UgalLRouteDecisionCallback;
 
 class SwitchNode : public Node{
 	// One loopback plus up to 64 data ports. The bundled topologies use at most
@@ -23,11 +32,32 @@ class SwitchNode : public Node{
 	uint32_t m_ecmpSeed;
 	std::unordered_map<uint32_t, std::vector<int> > m_rtTable; // map from ip address (u32) to possible ECMP port (index of dev)
 	std::unordered_map<uint32_t, uint32_t> m_nextHopNode;
-	bool m_pathLogging;
+	bool m_routeLabelLogging;
 	std::map<std::tuple<uint32_t, uint32_t, uint16_t, uint16_t>, int>
-		m_pinnedFlowOutDev;
+		m_labeledFlowOutDev;
 	std::set<std::tuple<uint32_t, uint32_t, uint16_t, uint16_t> >
-		m_loggedPinnedFlows;
+		m_loggedLabeledFlows;
+	std::map<std::tuple<uint32_t, uint32_t, uint16_t, uint16_t>, int>
+		m_ecmpFlowOutDev;
+	std::set<std::tuple<uint32_t, uint32_t, uint16_t, uint16_t> >
+		m_loggedEcmpFlows;
+	struct UgalLRoute {
+		int outDev;
+		uint32_t nextHopNodeId;
+		uint32_t minimalHops;
+		uint32_t nonminimalHops;
+		uint64_t nonminimalExtraRtt;
+	};
+	FlowRoutingStrategy m_flowRoutingStrategy;
+	uint64_t m_ugalLBiasBytes;
+	std::unordered_map<uint32_t, UgalLRoute> m_ugalLRoutes;
+	std::map<std::tuple<uint32_t, uint32_t, uint16_t, uint16_t>, int>
+		m_ugalLFlowOutDev;
+	std::set<std::tuple<uint32_t, uint32_t, uint16_t, uint16_t> >
+		m_loggedUgalLFlows;
+
+	UgalLRouteDecisionCallback m_ugalLRouteDecisionCallback;
+	uint64_t GetEgressQueueBytes(int outDev) const;
 
 	// monitor of PFC
 	uint32_t m_bytes[pCnt][pCnt][qCnt]; // m_bytes[inDev][outDev][qidx] is the bytes from inDev enqueued for outDev at qidx
@@ -59,6 +89,14 @@ public:
 	void SetEcmpSeed(uint32_t seed);
 	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx,
 	                   uint32_t nextHopNodeId);
+	void SetFlowRoutingStrategy(FlowRoutingStrategy strategy,
+	                            uint64_t ugalLBiasBytes = 0);
+	void SetRoutingDecisionLogging(bool enabled);
+	void SetUgalLRouteDecisionCallback(
+		UgalLRouteDecisionCallback callback);
+	void AddUgalLRoute(Ipv4Address &dstAddr, uint32_t intf_idx,
+	                   uint32_t nextHopNodeId, uint32_t minimalHops,
+	                   uint32_t nonminimalHops, uint64_t nonminimalExtraRtt);
 	void ClearTable();
 	bool SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch);
 	void SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p);

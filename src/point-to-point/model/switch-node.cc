@@ -11,7 +11,7 @@
 #include "ppp-header.h"
 #include "ns3/simulator.h"
 #include "ns3/int-header.h"
-#include "ns3/rdma-path-selection.h"
+#include "ns3/rdma-routing-label.h"
 #include <cmath>
 
 namespace ns3 {
@@ -41,10 +41,10 @@ TypeId SwitchNode::GetTypeId (void)
 			UintegerValue(9000),
 			MakeUintegerAccessor(&SwitchNode::m_maxRtt),
 			MakeUintegerChecker<uint32_t>())
-	.AddAttribute("PathLogging",
-			"Log the first forwarding decision for every explicitly pinned flow.",
+	.AddAttribute("RouteLabelLogging",
+			"Log the first forwarding decision for every labeled flow.",
 			BooleanValue(false),
-			MakeBooleanAccessor(&SwitchNode::m_pathLogging),
+			MakeBooleanAccessor(&SwitchNode::m_routeLabelLogging),
 			MakeBooleanChecker())
   ;
   return tid;
@@ -52,7 +52,9 @@ TypeId SwitchNode::GetTypeId (void)
 
 SwitchNode::SwitchNode(){
 	m_ecmpSeed = m_id;
-	m_pathLogging = false;
+	m_routeLabelLogging = false;
+	m_flowRoutingStrategy = FlowRoutingStrategy::ECMP;
+	m_ugalLBiasBytes = 0;
 	m_node_type = 1;
 	m_mmu = CreateObject<SwitchMmu>();
 	for (uint32_t i = 0; i < pCnt; i++)
@@ -78,13 +80,13 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	// entry found
 	auto &nexthops = entry->second;
 
-	// Build the stable flow tuple used by both normal ECMP and explicit path
-	// pinning. The reserved RDMA port is present on every data packet and is
+	// Build the stable flow tuple used by both normal ECMP and labeled routing.
+	// The reserved RDMA port is present on every data packet and is
 	// reversed into the ACK/NACK source port.
 	union {
 		uint8_t u8[4+4+2+2];
 		uint32_t u32[3];
-	} buf;
+	} buf{};
 	buf.u32[0] = ch.sip;
 	buf.u32[1] = ch.dip;
 	if (ch.l3Prot == 0x6)
@@ -94,38 +96,112 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD)
 		buf.u32[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
 
-	int32_t pathId = kUnpinnedRdmaPath;
+	int32_t routingLabel = kDefaultRoutingLabel;
 	if (ch.l3Prot == 0x11)
-		pathId = DecodeRdmaPathFromPorts(ch.udp.sport, ch.udp.dport);
+		routingLabel = DecodeRoutingLabelFromPorts(ch.udp.sport, ch.udp.dport);
 	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD)
-		pathId = DecodeRdmaPathFromPorts(ch.ack.sport, ch.ack.dport);
+		routingLabel = DecodeRoutingLabelFromPorts(ch.ack.sport, ch.ack.dport);
 
 	uint32_t idx = EcmpHash(buf.u8, 12, m_ecmpSeed) % nexthops.size();
-	if (pathId != kUnpinnedRdmaPath && nexthops.size() > 1) {
-		NS_ASSERT_MSG(static_cast<size_t>(pathId) < nexthops.size(),
-		              "Pinned path_id has no corresponding ECMP next hop");
-		idx = static_cast<uint32_t>(pathId);
+	int outDev = nexthops[idx];
+	const bool isRdmaPacket = ch.l3Prot == 0x11 || ch.l3Prot == 0xFC ||
+	                          ch.l3Prot == 0xFD;
+	auto flow = std::make_tuple(ch.sip, ch.dip,
+	                            static_cast<uint16_t>(buf.u32[2] & 0xffff),
+	                            static_cast<uint16_t>(buf.u32[2] >> 16));
+	auto ugalRoute = m_ugalLRoutes.find(ch.dip);
+	if (routingLabel != kDefaultRoutingLabel && nexthops.size() > 1) {
+		NS_ASSERT_MSG(static_cast<size_t>(routingLabel) < nexthops.size(),
+		              "Routing label has no corresponding next hop");
+		outDev = nexthops[static_cast<uint32_t>(routingLabel)];
 
-		auto flow = std::make_tuple(ch.sip, ch.dip,
-		                            static_cast<uint16_t>(buf.u32[2] & 0xffff),
-		                            static_cast<uint16_t>(buf.u32[2] >> 16));
-		auto inserted = m_pinnedFlowOutDev.emplace(flow, nexthops[idx]);
-		NS_ASSERT_MSG(inserted.first->second == nexthops[idx],
-		              "A pinned RDMA flow changed paths between packets");
+		auto inserted = m_labeledFlowOutDev.emplace(flow, outDev);
+		NS_ASSERT_MSG(inserted.first->second == outDev,
+		              "A labeled RDMA flow changed routes between packets");
 
-		if (m_pathLogging && m_loggedPinnedFlows.insert(flow).second) {
-			std::cout << "NS3_PATH switch=" << GetId()
+		if (m_routeLabelLogging && m_loggedLabeledFlows.insert(flow).second) {
+			std::cout << "NS3_ROUTE switch=" << GetId()
 			          << " src_ip=" << Ipv4Address(ch.sip)
 			          << " dst_ip=" << Ipv4Address(ch.dip)
 			          << " sport=" << std::get<2>(flow)
 			          << " dport=" << std::get<3>(flow)
-			          << " path=" << pathId
-			          << " out_dev=" << nexthops[idx]
-			          << " next_hop=" << m_nextHopNode[nexthops[idx]]
+			          << " label=" << routingLabel
+			          << " route=" << RoutingLabelName(routingLabel)
+			          << " out_dev=" << outDev
+			          << " next_hop=" << m_nextHopNode[outDev]
+			          << std::endl;
+		}
+	} else if (routingLabel == kDefaultRoutingLabel && isRdmaPacket &&
+	           m_flowRoutingStrategy == FlowRoutingStrategy::UGAL_L &&
+	           ugalRoute != m_ugalLRoutes.end()) {
+		auto selected = m_ugalLFlowOutDev.find(flow);
+		if (selected != m_ugalLFlowOutDev.end()) {
+			outDev = selected->second;
+		} else {
+			const UgalLRoute& route = ugalRoute->second;
+			const uint64_t minimalQueueBytes = GetEgressQueueBytes(outDev);
+			const uint64_t nonminimalQueueBytes =
+				GetEgressQueueBytes(route.outDev);
+			const uint64_t minimalCost =
+				minimalQueueBytes * static_cast<uint64_t>(route.minimalHops);
+			const uint64_t nonminimalCost =
+				nonminimalQueueBytes *
+					static_cast<uint64_t>(route.nonminimalHops) +
+				m_ugalLBiasBytes;
+			const bool useNonminimal = nonminimalCost < minimalCost;
+			outDev = useNonminimal ? route.outDev : outDev;
+			m_ugalLFlowOutDev.emplace(flow, outDev);
+			const bool reverseDirection =
+				ch.l3Prot == 0xFC || ch.l3Prot == 0xFD;
+			const uint16_t pg = reverseDirection ? ch.ack.pg : ch.udp.pg;
+			if (!m_ugalLRouteDecisionCallback.IsNull()) {
+				m_ugalLRouteDecisionCallback(
+					ch.sip, ch.dip, std::get<2>(flow), std::get<3>(flow),
+					pg, reverseDirection,
+					useNonminimal ? route.nonminimalExtraRtt : 0);
+			}
+
+			if (m_routeLabelLogging &&
+			    m_loggedUgalLFlows.insert(flow).second) {
+				std::cout << "NS3_UGAL switch=" << GetId()
+				          << " src_ip=" << Ipv4Address(ch.sip)
+				          << " dst_ip=" << Ipv4Address(ch.dip)
+				          << " sport=" << std::get<2>(flow)
+				          << " dport=" << std::get<3>(flow)
+				          << " minimal_q_bytes=" << minimalQueueBytes
+				          << " nonminimal_q_bytes=" << nonminimalQueueBytes
+				          << " minimal_hops=" << route.minimalHops
+				          << " nonminimal_hops=" << route.nonminimalHops
+				          << " minimal_cost=" << minimalCost
+				          << " nonminimal_cost=" << nonminimalCost
+				          << " bias_bytes=" << m_ugalLBiasBytes
+				          << " decision="
+				          << (useNonminimal ? "nonminimal" : "minimal")
+				          << " extra_rtt_ns="
+				          << (useNonminimal ? route.nonminimalExtraRtt : 0)
+				          << " out_dev=" << outDev
+				          << " next_hop=" << m_nextHopNode[outDev]
+				          << std::endl;
+			}
+		}
+	} else if (routingLabel == kDefaultRoutingLabel && isRdmaPacket) {
+		auto inserted = m_ecmpFlowOutDev.emplace(flow, outDev);
+		NS_ASSERT_MSG(inserted.first->second == outDev,
+		              "An ECMP RDMA flow changed routes between packets");
+
+		if (m_routeLabelLogging && m_loggedEcmpFlows.insert(flow).second) {
+			std::cout << "NS3_ECMP switch=" << GetId()
+			          << " src_ip=" << Ipv4Address(ch.sip)
+			          << " dst_ip=" << Ipv4Address(ch.dip)
+			          << " sport=" << std::get<2>(flow)
+			          << " dport=" << std::get<3>(flow)
+			          << " candidates=" << nexthops.size()
+			          << " out_dev=" << outDev
+			          << " next_hop=" << m_nextHopNode[outDev]
 			          << std::endl;
 		}
 	}
-	return nexthops[idx];
+	return outDev;
 }
 
 void SwitchNode::CheckAndSendPfc(uint32_t inDev, uint32_t qIndex){
@@ -215,6 +291,12 @@ uint32_t SwitchNode::EcmpHash(const uint8_t* key, size_t len, uint32_t seed) {
   return h;
 }
 
+uint64_t SwitchNode::GetEgressQueueBytes(int outDev) const {
+	Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(m_devices[outDev]);
+	NS_ASSERT_MSG(device != nullptr, "UGAL-L requires a QbbNetDevice");
+	return device->GetQueue()->GetNBytesTotal();
+}
+
 void SwitchNode::SetEcmpSeed(uint32_t seed){
 	m_ecmpSeed = seed;
 }
@@ -226,11 +308,41 @@ void SwitchNode::AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx,
 	m_nextHopNode[intf_idx] = nextHopNodeId;
 }
 
+void SwitchNode::SetFlowRoutingStrategy(FlowRoutingStrategy strategy,
+		uint64_t ugalLBiasBytes){
+	m_flowRoutingStrategy = strategy;
+	m_ugalLBiasBytes = ugalLBiasBytes;
+}
+
+void SwitchNode::SetRoutingDecisionLogging(bool enabled){
+	m_routeLabelLogging = enabled;
+}
+
+void SwitchNode::SetUgalLRouteDecisionCallback(
+		UgalLRouteDecisionCallback callback){
+	m_ugalLRouteDecisionCallback = callback;
+}
+
+void SwitchNode::AddUgalLRoute(Ipv4Address &dstAddr, uint32_t intf_idx,
+		uint32_t nextHopNodeId, uint32_t minimalHops,
+		uint32_t nonminimalHops, uint64_t nonminimalExtraRtt){
+	uint32_t dip = dstAddr.Get();
+	m_ugalLRoutes[dip] = {
+		static_cast<int>(intf_idx), nextHopNodeId, minimalHops, nonminimalHops,
+		nonminimalExtraRtt};
+	m_nextHopNode[intf_idx] = nextHopNodeId;
+}
+
 void SwitchNode::ClearTable(){
 	m_rtTable.clear();
 	m_nextHopNode.clear();
-	m_pinnedFlowOutDev.clear();
-	m_loggedPinnedFlows.clear();
+	m_labeledFlowOutDev.clear();
+	m_loggedLabeledFlows.clear();
+	m_ecmpFlowOutDev.clear();
+	m_loggedEcmpFlows.clear();
+	m_ugalLRoutes.clear();
+	m_ugalLFlowOutDev.clear();
+	m_loggedUgalLFlows.clear();
 }
 
 // This function can only be called in switch mode

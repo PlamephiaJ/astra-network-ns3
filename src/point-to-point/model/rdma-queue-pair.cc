@@ -36,6 +36,10 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_ipid = 0;
 	m_win = 0;
 	m_baseRtt = 0;
+	m_shortestPathWin = 0;
+	m_shortestPathRtt = 0;
+	m_forwardPathExtraRtt = 0;
+	m_reversePathExtraRtt = 0;
 	m_max_rate = 0;
 	m_var_win = false;
 	m_rate = 0;
@@ -110,10 +114,29 @@ uint64_t RdmaQueuePair::GetInitialSize(){
 
 void RdmaQueuePair::SetWin(uint32_t win){
 	m_win = win;
+	m_shortestPathWin = win;
 }
 
 void RdmaQueuePair::SetBaseRtt(uint64_t baseRtt){
 	m_baseRtt = baseRtt;
+	m_shortestPathRtt = baseRtt;
+}
+
+void RdmaQueuePair::UpdateRouteRtt(bool reverseDirection, uint64_t extraRtt){
+	if (reverseDirection)
+		m_reversePathExtraRtt = extraRtt;
+	else
+		m_forwardPathExtraRtt = extraRtt;
+	m_baseRtt = m_shortestPathRtt + m_forwardPathExtraRtt +
+		m_reversePathExtraRtt;
+	if (m_shortestPathWin == 0 || m_shortestPathRtt == 0)
+		return;
+	uint64_t scaledWin =
+		(static_cast<uint64_t>(m_shortestPathWin) * m_baseRtt +
+		 m_shortestPathRtt - 1) / m_shortestPathRtt;
+	NS_ASSERT_MSG(scaledWin <= UINT32_MAX,
+		"Route-aware RDMA window exceeds uint32_t");
+	m_win = static_cast<uint32_t>(scaledWin);
 }
 
 void RdmaQueuePair::SetVarWin(bool v){

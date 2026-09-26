@@ -55,7 +55,7 @@ build_lib(
     model/qbb-remote-channel.h
     model/rdma-driver.h
     model/rdma-hw.h
-    model/rdma-path-selection.h
+    model/rdma-routing-label.h
     model/rdma-queue-pair.h
     model/switch-mmu.h
     model/switch-node.h

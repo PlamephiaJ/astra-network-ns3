@@ -24,6 +24,10 @@ public:
 	uint16_t m_ipid;
 	uint32_t m_win; // bound of on-the-fly packets
 	uint64_t m_baseRtt; // base RTT of this qp
+	uint32_t m_shortestPathWin;
+	uint64_t m_shortestPathRtt;
+	uint64_t m_forwardPathExtraRtt;
+	uint64_t m_reversePathExtraRtt;
 	DataRate m_max_rate; // max rate
 	bool m_var_win; // variable window size
 	Time m_nextAvail;	//< Soonest time of next send
@@ -89,6 +93,7 @@ public:
 	void SetSize(uint64_t size);
 	void SetWin(uint32_t win);
 	void SetBaseRtt(uint64_t baseRtt);
+	void UpdateRouteRtt(bool reverseDirection, uint64_t extraRtt);
 	void SetVarWin(bool v);
 	void SetAppNotifyCallback(Callback<void> notifyAppFinish);
 	void SetAppSentCallback(Callback<void> notifyAppSent);
